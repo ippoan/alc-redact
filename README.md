@@ -22,6 +22,24 @@ PDF の 1 ページ目を黒塗りした JPEG を返す Cloud Run (rust-alc-api 
 | `gemini` | 502 | Gemini の失敗 (2 段 → 1 段の fallback も失敗) | `failed` (`gemini:`) |
 | `apply` | 500 | pdfium の描画・枠の検証・JPEG 化の失敗 | `failed` (`apply:`) |
 
+### `POST /extract`
+
+配車系 PDF から 14 項目 (積地・卸地の会社名/住所/電話/担当、積み/卸し日時、注意事項、相手先の会社名/担当者/電話) を
+Gemini で抽出する (rust の `crates/alc-notify/src/extract.rs` から移した。W8c-2)。PDF はそのまま Gemini に送る (描画しない)。
+
+- body: PDF のバイト列。上限 32 MiB
+- header `X-Self-Company` (任意): 自社名 (`tenants.name`) を UTF-8 で percent-encode したもの。連絡先から自社を除かせる
+- 200: `{"logistics": {...}}`。null の項目はキーごと省く (配車系でない PDF は `{}`)
+- エラー: `/redact` と同じ形
+
+| `error` | status | 意味 | rust の状態 |
+|---|---|---|---|
+| `bad_request` | 400 | body が空 / `X-Self-Company` が UTF-8 の percent-encode でない | — |
+| `not_pdf` | 415 | body が `%PDF-` で始まらない | (呼び手は拡張子で先に弾く) |
+| `gemini_key_missing` | 503 | `GEMINI_API_KEY` が無い | `completed` (logistics なし) |
+| `gemini` | 502 | Gemini の呼び出しの失敗 (やり直さない) | `failed` (`gemini:`) |
+| `parse` | 502 | Gemini の応答が schema の形でない | `failed` (`parse:`) |
+
 ### `GET /health`
 
 200 `ok` (`/healthz` は Cloud Run が使うので避けた)。

@@ -1,23 +1,28 @@
-//! HTTP の口。`POST /redact` (PDF → 1 ページ目を黒塗りした JPEG) と `GET /health`。
+//! HTTP の口。`POST /redact` (PDF → 1 ページ目を黒塗りした JPEG)、`POST /extract` (PDF → 配車の
+//! 14 項目の JSON) と `GET /health`。
 //!
 //! エラーは `{"error": "<固定コード>", "detail": "..."}`。呼び手 (notify-worker) はコードで
 //! rust の状態に対応づける (Cloud Run 自体の 503 と区別するため status だけに頼らない):
 //!
 //! | code | status | rust の状態 |
 //! |---|---|---|
-//! | `bad_request` | 400 | (body が空) |
+//! | `bad_request` | 400 | (body が空 / `X-Self-Company` が UTF-8 の percent-encode でない) |
 //! | `not_pdf` | 415 | `skipped` |
 //! | `gemini_key_missing` | 503 | `skipped` |
 //! | `gemini` | 502 | `failed` (接頭辞 "gemini:") |
-//! | `apply` | 500 | `failed` (接頭辞 "apply:")。pdfium の描画の失敗もここ |
+//! | `apply` | 500 | `failed` (接頭辞 "apply:")。pdfium の描画の失敗もここ (`/redact` だけ) |
+//! | `parse` | 502 | `failed` (接頭辞 "parse:")。Gemini の応答が schema の形でない (`/extract` だけ) |
+//!
+//! `/extract` の `gemini_key_missing` は、rust では「logistics 無しで completed」だった。
 //!
 //! 処理は同期で返す (投げっ放しの `tokio::spawn` はしない)。pdfium は `spawn_blocking` を await する。
 
+use crate::extract::ExtractError;
 use crate::gemini::GeminiClient;
 use crate::redact::{self, RedactionBox, RenderError};
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -39,6 +44,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/redact", post(redact))
+        .route("/extract", post(extract))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(Arc::new(state))
 }
@@ -80,8 +86,8 @@ async fn blocking<T: Send + 'static>(
         .map_err(apply_error)
 }
 
-async fn redact(State(state): State<Arc<AppState>>, body: Bytes) -> Result<Response, ApiError> {
-    let t_total = Instant::now();
+/// 空の body・`%PDF-` で始まらない body・Gemini の鍵が無い、を弾く (`/redact` と `/extract` で共通)。
+fn check_pdf<'a>(state: &'a AppState, body: &[u8]) -> Result<&'a GeminiClient, ApiError> {
     if body.is_empty() {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -103,6 +109,12 @@ async fn redact(State(state): State<Arc<AppState>>, body: Bytes) -> Result<Respo
             "GEMINI_API_KEY is not set",
         ));
     };
+    Ok(gemini)
+}
+
+async fn redact(State(state): State<Arc<AppState>>, body: Bytes) -> Result<Response, ApiError> {
+    let t_total = Instant::now();
+    let gemini = check_pdf(&state, &body)?;
 
     // 1) 1 ページ目を描画し、Gemini に送る JPEG を作る
     let t_render = Instant::now();
@@ -159,4 +171,44 @@ async fn redact(State(state): State<Arc<AppState>>, body: Bytes) -> Result<Respo
         ),
     ];
     Ok((headers, out).into_response())
+}
+
+/// 自社名のヘッダー。HTTP のヘッダーは ASCII なので、UTF-8 を percent-encode して送らせる。
+const SELF_COMPANY_HEADER: &str = "x-self-company";
+
+fn self_company(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(v) = headers.get(SELF_COMPANY_HEADER) else {
+        return Ok(None);
+    };
+    let bad = |detail: &str| ApiError::new(StatusCode::BAD_REQUEST, "bad_request", detail);
+    let raw = v.to_str().map_err(|_| bad("X-Self-Company is not ASCII"))?;
+    let name = percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .map_err(|_| bad("X-Self-Company is not percent-encoded UTF-8"))?;
+    Ok(Some(name.into_owned()))
+}
+
+async fn extract(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let t_total = Instant::now();
+    let gemini = check_pdf(&state, &body)?;
+    let hint = self_company(&headers)?;
+
+    let fields = gemini
+        .extract_logistics(&body, hint.as_deref())
+        .await
+        .map_err(|e| {
+            let code = match e {
+                ExtractError::Gemini(_) => "gemini",
+                ExtractError::Parse(_) => "parse",
+            };
+            tracing::warn!(code, "extract_failed: {e}");
+            ApiError::new(StatusCode::BAD_GATEWAY, code, e)
+        })?;
+    let total_ms = t_total.elapsed().as_millis() as u64;
+    tracing::info!(total_ms, "extract_ok");
+    Ok(Json(serde_json::json!({ "logistics": fields })).into_response())
 }

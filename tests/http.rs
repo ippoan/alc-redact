@@ -227,3 +227,126 @@ async fn broken_pdf_is_apply_500() {
     assert_eq!(error_code(&body), "apply");
     assert!(server.received_requests().await.unwrap().is_empty());
 }
+
+async fn post_extract(
+    app: Router,
+    body: Vec<u8>,
+    self_company: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
+    let mut req = Request::post("/extract").header("content-type", "application/pdf");
+    if let Some(v) = self_company {
+        req = req.header("x-self-company", v);
+    }
+    let resp = app
+        .oneshot(req.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// 自社名は percent-encode で届き、decode してプロンプトに入る。null の項目は返さない。
+#[tokio::test]
+async fn extract_returns_logistics_and_decodes_self_company() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ok_text(
+            r#"{"loading_place":"イオン関西RDC","unloading_at":null,"contact_person":"山田"}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    // 「テスト運輸」の UTF-8 を percent-encode したもの
+    let (status, body) = post_extract(
+        app(Some(&server), true),
+        red_pdf(),
+        Some("%E3%83%86%E3%82%B9%E3%83%88%E9%81%8B%E8%BC%B8"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        serde_json::json!({"logistics": {"loading_place": "イオン関西RDC", "contact_person": "山田"}})
+    );
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1);
+    let sent: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert!(sent["contents"][0]["parts"][1]["text"]
+        .as_str()
+        .unwrap()
+        .contains("「テスト運輸」"));
+}
+
+#[tokio::test]
+async fn extract_without_self_company_uses_label_inference() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ok_text("{}"))
+        .mount(&server)
+        .await;
+    let (status, body) = post_extract(app(Some(&server), true), red_pdf(), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, serde_json::json!({"logistics": {}}));
+    let reqs = server.received_requests().await.unwrap();
+    let sent: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert!(sent["contents"][0]["parts"][1]["text"]
+        .as_str()
+        .unwrap()
+        .contains("## 連絡先の判定"));
+}
+
+#[tokio::test]
+async fn extract_rejects_like_redact() {
+    let (status, body) = post_extract(app(None, true), vec![], None).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("bad_request"))
+    );
+    let (status, body) = post_extract(app(None, true), b"\x89PNG".to_vec(), None).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::UNSUPPORTED_MEDIA_TYPE, Some("not_pdf"))
+    );
+    let (status, body) = post_extract(app(None, true), red_pdf(), None).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("gemini_key_missing"))
+    );
+}
+
+#[tokio::test]
+async fn extract_bad_self_company_is_400() {
+    let server = MockServer::start().await;
+    // %FF は UTF-8 にならない
+    let (status, body) = post_extract(app(Some(&server), true), red_pdf(), Some("%FF")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "bad_request");
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn extract_gemini_failure_is_502_gemini() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(402).set_body_string("payment required"))
+        .mount(&server)
+        .await;
+    let (status, body) = post_extract(app(Some(&server), true), red_pdf(), None).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["error"], "gemini");
+    // やり直さない (1 回だけ)
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn extract_unparsable_text_is_502_parse() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ok_text("not json"))
+        .mount(&server)
+        .await;
+    let (status, body) = post_extract(app(Some(&server), true), red_pdf(), None).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["error"], "parse");
+}

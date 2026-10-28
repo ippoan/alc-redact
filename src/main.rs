@@ -1,6 +1,6 @@
 //! 環境変数:
 //! - `PORT` (既定 8080。Cloud Run が入れる)
-//! - `GEMINI_API_KEY` (Secret Manager の `gemini-api-key` を secretKeyRef で。無ければ /redact は 503)
+//! - `GEMINI_API_KEY` (Secret Manager の `gemini-api-key` を secretKeyRef で。無ければ /redact と /extract は 503)
 //! - `GEMINI_ENDPOINT`・`GEMINI_MODEL` (既定は `gemini::DEFAULT_*`。手元の確認で差し替える用)
 //! - `REDACT_2STAGE` (既定は 2 段。`0` で 1 段)
 //! - `RUST_LOG` (既定 info)
@@ -30,7 +30,9 @@ async fn main() {
         )
     });
     if gemini.is_none() {
-        tracing::warn!("GEMINI_API_KEY is not set; POST /redact returns 503 gemini_key_missing");
+        tracing::warn!(
+            "GEMINI_API_KEY is not set; POST /redact and /extract return 503 gemini_key_missing"
+        );
     }
     let two_stage = env_nonempty("REDACT_2STAGE").as_deref() != Some("0");
 

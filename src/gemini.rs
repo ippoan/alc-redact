@@ -322,8 +322,8 @@ impl GeminiClient {
         }
     }
 
-    /// generateContent を 1 回呼び、`candidates[0].content.parts[0].text` を返す。
-    async fn generate(
+    /// generateContent を 1 回呼び、`candidates[0].content.parts[0].text` を返す (抽出の `extract` も使う)。
+    pub(crate) async fn generate(
         &self,
         parts: serde_json::Value,
         schema: serde_json::Value,
