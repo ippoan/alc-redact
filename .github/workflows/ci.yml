@@ -1,0 +1,154 @@
+name: CI
+
+# 検査・image・配信 (Refs ippoan/rust-alc-api#680)。
+#   - pull_request → 検査 + image の build (push しない) + 緑なら auto-merge
+#   - main への push → 検査 + image を GHCR に push + staging へ配信
+#   - タグ v*       → 検査 + image を GHCR に push + 本番へ配信 (タグは tag-release.yml を手で打つ)
+# 配信は ippoan/ci-workflows の cloud-run-deploy.yml (WIF、GHCR → Artifact Registry の remote → digest 固定)。
+# project・AR のパス・SA・service 名は repo に書かず vars で渡す。service の初回作成・IAM・secret の
+# 付与が済むまでは、repo の variables の STAGING_DEPLOY_ENABLED / PRODUCTION_DEPLOY_ENABLED で止めておく。
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # PR の古い run は捨てるが、main とタグは途中で切らない
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  check:
+    name: check (fmt / clippy / test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      # tests/http.rs は本物の pdfium で描画する。版と sha256 は Dockerfile の ARG から読む (正本は 1 か所)
+      - name: pdfium を入れる (Dockerfile と同じ版)
+        run: |
+          set -euo pipefail
+          ver=$(sed -n 's/^ARG PDFIUM_VERSION=//p' Dockerfile)
+          sum=$(sed -n 's/^ARG PDFIUM_SHA256=//p' Dockerfile)
+          curl -fsSL -o "$RUNNER_TEMP/pdfium.tgz" "https://github.com/bblanchon/pdfium-binaries/releases/download/${ver}/pdfium-linux-x64.tgz"
+          echo "${sum}  $RUNNER_TEMP/pdfium.tgz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/pdfium" && tar -xzf "$RUNNER_TEMP/pdfium.tgz" -C "$RUNNER_TEMP/pdfium"
+          sudo cp "$RUNNER_TEMP/pdfium/lib/libpdfium.so" /usr/lib/libpdfium.so
+          sudo ldconfig
+      - run: cargo test --locked --no-fail-fast
+
+  image:
+    name: image (build${{ github.event_name == 'push' && ' + push' || '' }})
+    needs: [check]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then tag="${GITHUB_REF_NAME}"; else tag="sha-${GITHUB_SHA::7}"; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name == 'push' }}
+          provenance: false
+          tags: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-staging:
+    name: Deploy (staging)
+    needs: [image]
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      vars.STAGING_DEPLOY_ENABLED == 'true'
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+      packages: read
+    uses: ippoan/ci-workflows/.github/workflows/cloud-run-deploy.yml@main
+    with:
+      service: ${{ vars.CLOUD_RUN_SERVICE_STAGING }}
+      region: ${{ vars.GCP_REGION }}
+      project: ${{ vars.GCP_PROJECT_ID_STAGING }}
+      ghcr_image: ghcr.io/${{ github.repository }}
+      image_tag: ${{ needs.image.outputs.tag }}
+      ar_repo: ${{ vars.ALC_REDACT_AR_REPO }}
+      workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+      service_account: ${{ vars.GCP_WIF_SERVICE_ACCOUNT_STAGING }}
+      # 既存の secret `gemini-api-key` を secretKeyRef で (値は workflow とログを通らない)
+      update_secrets: GEMINI_API_KEY=gemini-api-key:latest
+
+  deploy-production:
+    name: Deploy (production)
+    needs: [image]
+    if: >-
+      github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
+      vars.PRODUCTION_DEPLOY_ENABLED == 'true'
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+      packages: read
+    uses: ippoan/ci-workflows/.github/workflows/cloud-run-deploy.yml@main
+    with:
+      service: ${{ vars.CLOUD_RUN_SERVICE_PRODUCTION }}
+      region: ${{ vars.GCP_REGION }}
+      project: ${{ vars.GCP_PROJECT_ID_PRODUCTION }}
+      ghcr_image: ghcr.io/${{ github.repository }}
+      image_tag: ${{ needs.image.outputs.tag }}
+      ar_repo: ${{ vars.ALC_REDACT_AR_REPO }}
+      workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+      service_account: ${{ vars.GCP_WIF_SERVICE_ACCOUNT_PRODUCTION }}
+      update_secrets: GEMINI_API_KEY=gemini-api-key:latest
+
+  # green の PR を merge する (ippoan/ci-workflows の reusable。merge は GitHub App の token で行う)
+  auto-merge:
+    name: Auto Merge
+    needs: [check, image]
+    if: github.event_name == 'pull_request' && needs.check.result == 'success' && needs.image.result == 'success'
+    uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
+    with:
+      # deploy の 2 つは PR の run では走らない (main / タグ v* だけ) ので、merge の gate から外す
+      deploy_gate_ignore: 'deploy-staging,deploy-production'
+    permissions:
+      contents: write
+      pull-requests: write
+      # 無いと startup_failure になる
+      checks: read
+    secrets:
+      CI_APP_ID: ${{ secrets.CI_APP_ID }}
+      CI_APP_PRIVATE_KEY: ${{ secrets.CI_APP_PRIVATE_KEY }}
