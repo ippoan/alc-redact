@@ -116,8 +116,12 @@ fn normalize_text(v: Option<String>) -> Option<String> {
 fn normalize_kubun(v: Option<String>) -> Option<String> {
     let t = v?;
     let t = t.trim();
-    let t = t.strip_suffix("発行").unwrap_or(t);
-    KUBUN.contains(&t).then(|| t.to_string())
+    // 「再発行」は KUBUN そのもの。「発行」を落とすのは、そのままでは無いとき (「追加発行」→「追加」) だけ
+    let found = [Some(t), t.strip_suffix("発行")]
+        .into_iter()
+        .flatten()
+        .find(|c| KUBUN.contains(c));
+    found.map(str::to_string)
 }
 
 impl EtcCardRow {
@@ -236,6 +240,19 @@ mod tests {
         assert!(p.contains("rows を空の配列"));
     }
 
+    #[test]
+    fn kubun_keeps_reissue_and_strips_hakko_suffix() {
+        let k = |s: &str| normalize_kubun(Some(s.into()));
+        assert_eq!(k("再発行").as_deref(), Some("再発行"));
+        assert_eq!(k(" 再発行 ").as_deref(), Some("再発行"));
+        assert_eq!(k("新規発行").as_deref(), Some("新規"));
+        assert_eq!(k("追加発行").as_deref(), Some("追加"));
+        assert_eq!(k("新規").as_deref(), Some("新規"));
+        assert_eq!(k("再"), None);
+        assert_eq!(k("解約"), None);
+        assert_eq!(normalize_kubun(None), None);
+    }
+
     /// (a) 正常 2 行。PDF は inlineData、generationConfig に mime と schema の両方。
     #[tokio::test]
     async fn two_rows() {
@@ -254,6 +271,7 @@ mod tests {
         assert_eq!(got.rows.len(), 2);
         assert_eq!(got.rows[0].kubun.as_deref(), Some("新規"));
         assert_eq!(got.rows[0].card_number.as_deref(), Some("0000000000000010"));
+        assert_eq!(got.rows[1].kubun.as_deref(), Some("再発行"));
         assert_eq!(
             got.rows[1].vehicle_number.as_deref(),
             Some("テスト 100 い 5678")
