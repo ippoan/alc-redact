@@ -167,15 +167,31 @@ impl GeminiClient {
         pdf: &[u8],
         self_company_hint: Option<&str>,
     ) -> Result<LogisticsFields, ExtractError> {
+        // 14 項目 × 短い文字列なので 1024 で足りる
+        self.extract_from_pdf(
+            pdf,
+            &build_logistics_prompt(self_company_hint),
+            logistics_response_schema(),
+            1024,
+        )
+        .await
+    }
+
+    /// PDF をそのまま (`application/pdf` の inlineData) とプロンプトを送り、schema の形の JSON を
+    /// `T` に読む (`/extract` と `/extract/etc-card` で共通)。応答の text はログに出さない。
+    pub(crate) async fn extract_from_pdf<T: serde::de::DeserializeOwned>(
+        &self,
+        pdf: &[u8],
+        prompt: &str,
+        schema: serde_json::Value,
+        max_output_tokens: u32,
+    ) -> Result<T, ExtractError> {
         let data = base64::engine::general_purpose::STANDARD.encode(pdf);
         let parts = serde_json::json!([
             { "inlineData": { "mimeType": "application/pdf", "data": data } },
-            { "text": build_logistics_prompt(self_company_hint) }
+            { "text": prompt }
         ]);
-        // 14 項目 × 短い文字列なので 1024 で足りる
-        let text = self
-            .generate(parts, logistics_response_schema(), 1024)
-            .await?;
+        let text = self.generate(parts, schema, max_output_tokens).await?;
         serde_json::from_str(&text).map_err(|e| {
             tracing::warn!(text_len = text.len(), "extract: parse failed: {e}");
             ExtractError::Parse(e)

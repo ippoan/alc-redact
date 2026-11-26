@@ -350,3 +350,66 @@ async fn extract_unparsable_text_is_502_parse() {
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(body["error"], "parse");
 }
+
+async fn post_etc_card(app: Router, body: Vec<u8>) -> (StatusCode, serde_json::Value) {
+    let req = Request::post("/extract/etc-card").header("content-type", "application/pdf");
+    let resp = app
+        .oneshot(req.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// 番号は正規化され、空行は落ち、null の項目もキーが残る。番号・車両番号は架空値。
+#[tokio::test]
+async fn extract_etc_card_returns_normalized_rows() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ok_text(
+            &serde_json::json!({
+                "rows": [
+                    {"kubun": "新規", "card_number": "000000-0000-00001-0",
+                     "vehicle_number": "テスト 100 あ 1234", "obu_number": "123"},
+                    {"kubun": null, "card_number": null, "vehicle_number": null, "obu_number": null}
+                ],
+                "total": 1
+            })
+            .to_string(),
+        ))
+        .mount(&server)
+        .await;
+    let (status, body) = post_etc_card(app(Some(&server), true), red_pdf()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "rows": [{"kubun": "新規", "card_number": "0000000000000010",
+                      "vehicle_number": "テスト 100 あ 1234", "obu_number": null}],
+            "total": 1
+        })
+    );
+}
+
+#[tokio::test]
+async fn extract_etc_card_errors_like_extract() {
+    let (status, body) = post_etc_card(app(None, true), b"\x89PNG".to_vec()).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::UNSUPPORTED_MEDIA_TYPE, Some("not_pdf"))
+    );
+    let (status, body) = post_etc_card(app(None, true), red_pdf()).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("gemini_key_missing"))
+    );
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ok_text("not json"))
+        .mount(&server)
+        .await;
+    let (status, body) = post_etc_card(app(Some(&server), true), red_pdf()).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["error"], "parse");
+}

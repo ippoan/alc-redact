@@ -40,6 +40,17 @@ Gemini で抽出する (rust の `crates/alc-notify/src/extract.rs` から移し
 | `gemini` | 502 | Gemini の呼び出しの失敗 (やり直さない) | `failed` (`gemini:`) |
 | `parse` | 502 | Gemini の応答が schema の形でない | `failed` (`parse:`) |
 
+### `POST /extract/etc-card`
+
+「ETC コーポレートカード発行明細書」の PDF からカードの行を Gemini で抽出する (ohishi-exp/nuxt-dtako-admin#1287。
+auth-worker の `extractEtcCard` が呼ぶ)。PDF はそのまま Gemini に送る。
+
+- body: PDF のバイト列。上限 32 MiB
+- 200: `{"rows": [{"kubun", "card_number", "vehicle_number", "obu_number"}], "total": n | null}`。各項目は文字列か null (キーは残す)
+  - `kubun`: `新規` / `追加` / `再発行`。`card_number` (16 桁)・`obu_number` (車載器管理番号、19 桁) は数字だけで、桁数が合わなければ null
+  - `vehicle_number`: 原文どおり (全角数字だけ半角に)。全項目 null の行 (空行) は返さない。明細書でない PDF は `rows: []`
+- エラー: `/extract` と同じ (`X-Self-Company` は使わない)。ログは行数と null の個数だけ (番号は出さない)
+
 ### `GET /health`
 
 200 `ok` (`/healthz` は Cloud Run が使うので避けた)。
