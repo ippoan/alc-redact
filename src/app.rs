@@ -1,5 +1,6 @@
 //! HTTP の口。`POST /redact` (PDF → 1 ページ目を黒塗りした JPEG)、`POST /extract` (PDF → 配車の
-//! 14 項目の JSON) と `GET /health`。
+//! 14 項目の JSON)、`POST /extract/etc-card` (ETC コーポレートカード発行明細書の PDF → カードの行の
+//! JSON) と `GET /health`。
 //!
 //! エラーは `{"error": "<固定コード>", "detail": "..."}`。呼び手 (notify-worker) はコードで
 //! rust の状態に対応づける (Cloud Run 自体の 503 と区別するため status だけに頼らない):
@@ -11,7 +12,7 @@
 //! | `gemini_key_missing` | 503 | `skipped` |
 //! | `gemini` | 502 | `failed` (接頭辞 "gemini:") |
 //! | `apply` | 500 | `failed` (接頭辞 "apply:")。pdfium の描画の失敗もここ (`/redact` だけ) |
-//! | `parse` | 502 | `failed` (接頭辞 "parse:")。Gemini の応答が schema の形でない (`/extract` だけ) |
+//! | `parse` | 502 | `failed` (接頭辞 "parse:")。Gemini の応答が schema の形でない (`/extract*` だけ) |
 //!
 //! `/extract` の `gemini_key_missing` は、rust では「logistics 無しで completed」だった。
 //!
@@ -45,6 +46,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(|| async { "ok" }))
         .route("/redact", post(redact))
         .route("/extract", post(extract))
+        .route("/extract/etc-card", post(extract_etc_card))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(Arc::new(state))
 }
@@ -200,15 +202,34 @@ async fn extract(
     let fields = gemini
         .extract_logistics(&body, hint.as_deref())
         .await
-        .map_err(|e| {
-            let code = match e {
-                ExtractError::Gemini(_) => "gemini",
-                ExtractError::Parse(_) => "parse",
-            };
-            tracing::warn!(code, "extract_failed: {e}");
-            ApiError::new(StatusCode::BAD_GATEWAY, code, e)
-        })?;
+        .map_err(extract_error)?;
     let total_ms = t_total.elapsed().as_millis() as u64;
     tracing::info!(total_ms, "extract_ok");
     Ok(Json(serde_json::json!({ "logistics": fields })).into_response())
+}
+
+/// 抽出の失敗を 502 `gemini` / `parse` にする (`/extract` と `/extract/etc-card` で共通)。
+fn extract_error(e: ExtractError) -> ApiError {
+    let code = match e {
+        ExtractError::Gemini(_) => "gemini",
+        ExtractError::Parse(_) => "parse",
+    };
+    tracing::warn!(code, "extract_failed: {e}");
+    ApiError::new(StatusCode::BAD_GATEWAY, code, e)
+}
+
+/// ETC コーポレートカード発行明細書 → `{"rows": [...], "total": n | null}`。
+async fn extract_etc_card(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let t_total = Instant::now();
+    let gemini = check_pdf(&state, &body)?;
+    let statement = gemini
+        .extract_etc_card(&body)
+        .await
+        .map_err(extract_error)?;
+    let total_ms = t_total.elapsed().as_millis() as u64;
+    tracing::info!(total_ms, "extract_etc_card_ok");
+    Ok(Json(statement).into_response())
 }

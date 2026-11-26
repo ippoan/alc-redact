@@ -2,6 +2,7 @@
 //! (rust-alc-api の W8d。Refs ippoan/rust-alc-api#680)。配車系 PDF の 14 項目の抽出 (`/extract`) も持つ (W8c-2)。
 
 pub mod app;
+pub mod etc_card;
 pub mod extract;
 pub mod gemini;
 pub mod redact;
